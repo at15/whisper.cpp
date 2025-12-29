@@ -36,7 +36,10 @@ The binary will be at `build/bin/whisper-streamserver`.
 ./build/bin/whisper-streamserver -m models/ggml-base.bin --vad-thold 0.001
 
 # Use Silero VAD model
-./build/bin/whisper-streamserver -m models/ggml-base.bin --vad-model models/ggml-silero-v6.2.0.bin --vad-debug
+./build/bin/whisper-streamserver -m models/ggml-small.bin --vad-model models/ggml-silero-v6.2.0.bin --vad-debug
+
+# Use medium model
+./build/bin/whisper-streamserver -m models/ggml-medium.bin --vad-model models/ggml-silero-v6.2.0.bin --vad-debug
 ```
 
 ### Command-line Options
