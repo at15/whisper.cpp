@@ -84,6 +84,15 @@ struct whisper_params {
     std::string vad_model = "";         // Path to VAD model (empty = use energy-based)
     float vad_threshold = 0.5f;         // VAD model probability threshold
 
+    // VAD segment detection parameters (matching whisper-cli)
+    int32_t vad_min_speech_duration_ms = 250;   // Min speech duration to be a valid segment
+    int32_t vad_min_silence_duration_ms = 100;  // Min silence duration to end a segment
+    int32_t vad_speech_pad_ms = 30;             // Padding before/after segments
+    int32_t vad_max_speech_duration_ms = 5000;  // Max segment duration before forcing a split
+
+    // Streaming inference parameters
+    int32_t inference_interval_ms = 1000;  // Run inference every N ms during speech (0 = every step)
+
     bool use_gpu = true;
     bool flash_attn = true;
 
@@ -101,6 +110,15 @@ struct TranscriptSegment {
     std::string text;
     int64_t t0;  // Start time in centiseconds
     int64_t t1;  // End time in centiseconds
+};
+
+// VAD segment state for streaming (tracks speech segment boundaries with hysteresis)
+struct VADSegmentState {
+    bool in_speech = false;              // Currently in a speech segment
+    int64_t speech_start_ms = 0;         // When current segment started (ms from stream start)
+    int silence_duration_samples = 0;    // Accumulated silence samples since last speech
+    float last_max_prob = 0.0f;          // Last VAD probability for debugging
+    int pending_audio_samples = 0;       // Audio samples pending inference
 };
 
 // Stream session state
@@ -127,6 +145,9 @@ struct StreamSession {
     bool active_speech = false;
     int n_iter = 0;
     int silent_chunks = 0;  // Count consecutive silent chunks
+
+    // VAD segment tracking (new)
+    VADSegmentState vad_segment;
 };
 
 // Global state
@@ -241,6 +262,171 @@ bool is_speech(const std::vector<float>& pcmf32, const whisper_params& params) {
     }
 }
 
+// Result from segment-aware VAD detection
+struct VADDetectionResult {
+    bool should_process;       // Should we run inference on accumulated audio?
+    bool segment_started;      // A new speech segment just started
+    bool segment_ended;        // The current speech segment just ended
+    float max_prob;            // Maximum probability from VAD model
+};
+
+// Segment-aware VAD detection with hysteresis (like whisper-cli's approach)
+// Uses different thresholds for entering vs exiting speech state to prevent
+// premature segment endings and reduce false positives
+VADDetectionResult detect_speech_segment(
+    VADSegmentState& state,
+    const std::vector<float>& new_audio,
+    int stream_ms,
+    const whisper_params& params) {
+
+    VADDetectionResult result = {false, false, false, 0.0f};
+
+    if (new_audio.empty()) {
+        return result;
+    }
+
+    // Calculate VAD probability for new audio
+    float max_prob = 0.0f;
+
+    if (g_vad_ctx != nullptr) {
+        std::lock_guard<std::mutex> lock(vad_mutex);
+
+        if (!whisper_vad_detect_speech(g_vad_ctx, new_audio.data(), new_audio.size())) {
+            if (params.vad_debug) {
+                LOG("VAD segment: detection failed");
+            }
+            // Treat as silence on detection failure
+            max_prob = 0.0f;
+        } else {
+            int n_probs = whisper_vad_n_probs(g_vad_ctx);
+            float* probs = whisper_vad_probs(g_vad_ctx);
+
+            if (n_probs > 0 && probs != nullptr) {
+                for (int i = 0; i < n_probs; i++) {
+                    if (probs[i] > max_prob) {
+                        max_prob = probs[i];
+                    }
+                }
+            }
+        }
+    } else {
+        // Energy-based fallback - convert to probability-like value
+        std::vector<float> filtered = new_audio;
+        if (params.freq_thold > 0.0f) {
+            high_pass_filter(filtered, params.freq_thold, WHISPER_SAMPLE_RATE);
+        }
+
+        float energy = 0.0f;
+        for (const auto& sample : filtered) {
+            energy += sample * sample;
+        }
+        energy = std::sqrt(energy / filtered.size());
+
+        // Convert energy to 0-1 range (rough approximation)
+        max_prob = std::min(1.0f, energy / (params.vad_thold * 2.0f));
+    }
+
+    result.max_prob = max_prob;
+    state.last_max_prob = max_prob;
+
+    // Hysteresis thresholds (like whisper-cli's whisper_vad_segments_from_probs)
+    // pos_threshold: higher threshold to START speech segment
+    // neg_threshold: lower threshold to END speech segment
+    float pos_threshold = params.vad_threshold;
+    float neg_threshold = std::max(0.01f, params.vad_threshold - 0.15f);
+
+    int new_samples = (int)new_audio.size();
+
+    if (!state.in_speech) {
+        // Not currently in a speech segment
+        if (max_prob >= pos_threshold) {
+            // Speech detected - start a new segment
+            state.in_speech = true;
+            state.speech_start_ms = stream_ms;
+            state.silence_duration_samples = 0;
+            state.pending_audio_samples = new_samples;
+            result.segment_started = true;
+            result.should_process = true;
+
+            if (params.vad_debug) {
+                LOG("VAD segment: STARTED at %lldms (prob=%.3f >= %.3f)",
+                    (long long)state.speech_start_ms, max_prob, pos_threshold);
+            }
+        }
+    } else {
+        // Currently in a speech segment
+        state.pending_audio_samples += new_samples;
+
+        if (max_prob < neg_threshold) {
+            // Below negative threshold - accumulate silence
+            state.silence_duration_samples += new_samples;
+
+            int min_silence_samples = ms_to_samples(params.vad_min_silence_duration_ms);
+
+            if (state.silence_duration_samples >= min_silence_samples) {
+                // Enough silence - end the segment
+                int segment_duration_ms = stream_ms - state.speech_start_ms;
+
+                if (segment_duration_ms >= params.vad_min_speech_duration_ms) {
+                    // Valid segment (meets min duration)
+                    result.segment_ended = true;
+                    result.should_process = true;
+
+                    if (params.vad_debug) {
+                        LOG("VAD segment: ENDED at %dms (duration=%dms, silence=%dms, prob=%.3f < %.3f)",
+                            stream_ms, segment_duration_ms,
+                            state.silence_duration_samples * 1000 / WHISPER_SAMPLE_RATE,
+                            max_prob, neg_threshold);
+                    }
+                } else {
+                    // Too short - discard
+                    if (params.vad_debug) {
+                        LOG("VAD segment: DISCARDED (duration=%dms < %dms)",
+                            segment_duration_ms, params.vad_min_speech_duration_ms);
+                    }
+                }
+
+                state.in_speech = false;
+                state.silence_duration_samples = 0;
+                state.pending_audio_samples = 0;
+            } else {
+                // Still counting silence - continue processing
+                result.should_process = true;
+            }
+        } else {
+            // Above negative threshold - reset silence counter, continue speech
+            state.silence_duration_samples = 0;
+            result.should_process = true;
+
+            if (params.vad_debug && max_prob >= pos_threshold) {
+                LOG("VAD segment: CONTINUING (prob=%.3f, pending=%dms)",
+                    max_prob, state.pending_audio_samples * 1000 / WHISPER_SAMPLE_RATE);
+            }
+        }
+
+        // Check for max segment duration - force split if segment is too long
+        int segment_duration_ms = stream_ms - state.speech_start_ms;
+        if (params.vad_max_speech_duration_ms > 0 &&
+            segment_duration_ms >= params.vad_max_speech_duration_ms) {
+            // Force segment end
+            result.segment_ended = true;
+            result.should_process = true;
+
+            if (params.vad_debug) {
+                LOG("VAD segment: FORCED END at %dms (max duration %dms reached)",
+                    stream_ms, params.vad_max_speech_duration_ms);
+            }
+
+            // Reset state but stay in speech mode for next segment
+            state.speech_start_ms = stream_ms;  // Start new segment from here
+            state.pending_audio_samples = 0;
+            state.silence_duration_samples = 0;
+        }
+    }
+
+    return result;
+}
+
 void print_usage(int argc, char** argv, const whisper_params& params, const server_params& sparams) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
@@ -261,6 +447,11 @@ void print_usage(int argc, char** argv, const whisper_params& params, const serv
     fprintf(stderr, "  --freq-thold N             [%-7.1f] high-pass filter cutoff Hz\n", params.freq_thold);
     fprintf(stderr, "  --no-vad                   [%-7s] disable VAD, always run inference\n", params.no_vad ? "true" : "false");
     fprintf(stderr, "  --vad-debug                [%-7s] log VAD values for debugging\n", params.vad_debug ? "true" : "false");
+    fprintf(stderr, "  --vad-min-speech N         [%-7d] min speech duration in ms\n", params.vad_min_speech_duration_ms);
+    fprintf(stderr, "  --vad-min-silence N        [%-7d] min silence duration to end segment in ms\n", params.vad_min_silence_duration_ms);
+    fprintf(stderr, "  --vad-speech-pad N         [%-7d] speech padding in ms\n", params.vad_speech_pad_ms);
+    fprintf(stderr, "  --vad-max-speech N         [%-7d] max segment duration before forcing split in ms\n", params.vad_max_speech_duration_ms);
+    fprintf(stderr, "  --inference-interval N     [%-7d] run inference every N ms during speech (0=every step)\n", params.inference_interval_ms);
     fprintf(stderr, "\n");
     fprintf(stderr, "Server options:\n");
     fprintf(stderr, "  --host HOST                [%-7s] hostname\n", sparams.hostname.c_str());
@@ -304,6 +495,16 @@ bool parse_params(int argc, char** argv, whisper_params& params, server_params& 
             params.no_vad = true;
         } else if (arg == "--vad-debug") {
             params.vad_debug = true;
+        } else if (arg == "--vad-min-speech") {
+            params.vad_min_speech_duration_ms = std::stoi(argv[++i]);
+        } else if (arg == "--vad-min-silence") {
+            params.vad_min_silence_duration_ms = std::stoi(argv[++i]);
+        } else if (arg == "--vad-speech-pad") {
+            params.vad_speech_pad_ms = std::stoi(argv[++i]);
+        } else if (arg == "--vad-max-speech") {
+            params.vad_max_speech_duration_ms = std::stoi(argv[++i]);
+        } else if (arg == "--inference-interval") {
+            params.inference_interval_ms = std::stoi(argv[++i]);
         } else if (arg == "--host") {
             sparams.hostname = argv[++i];
         } else if (arg == "--port") {
@@ -379,11 +580,11 @@ void output_results(const StreamSession& session, const whisper_params& params) 
 }
 
 // Process audio for a session and run inference if needed
+// Uses segment-aware VAD with hysteresis for better segment detection
 void process_session_audio(StreamSession& session, whisper_context* ctx, const whisper_params& params) {
     const int n_samples_step = ms_to_samples(params.step_ms);
     const int n_samples_len = ms_to_samples(params.length_ms);
     const int n_samples_keep = ms_to_samples(params.keep_ms);
-    const int n_new_line = std::max(1, params.length_ms / params.step_ms - 1);
 
     // Check if we have enough new audio to process
     if ((int)session.pcmf32_new.size() < n_samples_step) {
@@ -392,13 +593,56 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
 
     int n_samples_new = session.pcmf32_new.size();
 
-    // Take up to length_ms audio from previous iteration
+    // Run segment-aware VAD detection with hysteresis
+    VADDetectionResult vad_result = params.no_vad
+        ? VADDetectionResult{true, false, false, 1.0f}  // Always process if VAD disabled
+        : detect_speech_segment(session.vad_segment, session.pcmf32_new, session.stream_ms, params);
+
+    // Handle segment start - reset buffers for new segment
+    if (vad_result.segment_started) {
+        session.pcmf32_old.clear();
+        session.current_t0 = session.stream_ms / 10;  // Start time in centiseconds
+        session.n_iter = 0;
+    }
+
+    // Handle segment end - finalize transcription
+    if (vad_result.segment_ended && !session.current_text.empty()) {
+        TranscriptSegment seg;
+        seg.index = session.segments.size();
+        seg.text = session.current_text;
+        seg.t0 = session.current_t0;
+        seg.t1 = session.stream_ms / 10;
+        session.segments.push_back(seg);
+
+        LOG("SEGMENT session=%s index=%d t0=%lld t1=%lld text=\"%s\"",
+            session.session_id.c_str(), seg.index, (long long)seg.t0, (long long)seg.t1, seg.text.c_str());
+
+        session.current_text.clear();
+
+        // If still in speech (forced split), start new segment from current position
+        if (session.vad_segment.in_speech) {
+            session.current_t0 = session.stream_ms / 10;
+            session.pcmf32_old.clear();
+            session.n_iter = 0;
+        } else {
+            session.pcmf32_old.clear();
+            session.pcmf32_new.clear();
+            return;
+        }
+    }
+
+    // Only process if VAD indicates we should
+    if (!vad_result.should_process) {
+        session.pcmf32_new.clear();
+        return;
+    }
+
+    // Build processing buffer: [old_overlap | new_audio]
     int n_samples_take = std::min(
         (int)session.pcmf32_old.size(),
         std::max(0, n_samples_keep + n_samples_len - n_samples_new)
     );
 
-    // Build processing buffer: [old_overlap | new_audio]
     session.pcmf32.resize(n_samples_take + n_samples_new);
     if (n_samples_take > 0) {
         std::copy(
@@ -415,123 +659,58 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
 
     session.pcmf32_old = session.pcmf32;
 
-    // VAD check - run on new audio only (not the entire accumulated buffer)
-    // This keeps VAD processing time constant (~100ms for 500ms of audio)
-    bool speech_detected = params.no_vad ? true : is_speech(session.pcmf32_new, params);
+    // Check if we should run inference (based on inference_interval_ms)
+    int pending_ms = session.vad_segment.pending_audio_samples * 1000 / WHISPER_SAMPLE_RATE;
+    bool should_run_inference = (params.inference_interval_ms <= 0) ||
+                                (pending_ms >= params.inference_interval_ms) ||
+                                vad_result.segment_ended;
 
-    // Track consecutive silent chunks to reset active_speech
-    if (speech_detected) {
-        session.silent_chunks = 0;
+    if (!should_run_inference) {
+        session.pcmf32_new.clear();
+        return;
+    }
+
+    int audio_ms = (int)(session.pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE);
+    LOG("INFER session=%s iter=%d audio=%dms pending=%dms prob=%.3f",
+        session.session_id.c_str(), session.n_iter, audio_ms, pending_ms, vad_result.max_prob);
+
+    // Run inference
+    std::lock_guard<std::mutex> lock(whisper_mutex);
+
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_realtime = false;
+    wparams.print_progress = false;
+    wparams.print_timestamps = false;
+    wparams.print_special = false;
+    wparams.translate = session.translate;
+    wparams.language = session.language.c_str();
+    wparams.n_threads = params.n_threads;
+    wparams.single_segment = true;
+    wparams.no_context = true;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    if (whisper_full(ctx, wparams, session.pcmf32.data(), session.pcmf32.size()) == 0) {
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
+        // Extract results
+        std::string text;
+        const int n_segments = whisper_full_n_segments(ctx);
+        for (int i = 0; i < n_segments; ++i) {
+            text += whisper_full_get_segment_text(ctx, i);
+        }
+
+        session.current_text = text;
+
+        LOG("INFER session=%s DONE time=%lldms text_len=%zu text=\"%.50s%s\"",
+            session.session_id.c_str(), (long long)duration_ms, text.length(),
+            text.c_str(), text.length() > 50 ? "..." : "");
     } else {
-        session.silent_chunks++;
+        LOG("INFER session=%s FAILED", session.session_id.c_str());
     }
 
-    // Reset active_speech after 3 consecutive silent chunks (1.5s of silence at 500ms step)
-    // This prevents hallucinations during extended silence
-    const int max_silent_chunks = 3;
-    if (session.active_speech && session.silent_chunks >= max_silent_chunks) {
-        LOG("VAD session=%s resetting active_speech after %d silent chunks",
-            session.session_id.c_str(), session.silent_chunks);
-
-        // Flush any pending transcription as a segment before resetting
-        if (!session.current_text.empty()) {
-            TranscriptSegment seg;
-            seg.index = session.segments.size();
-            seg.text = session.current_text;
-            seg.t0 = session.current_t0;
-            seg.t1 = session.stream_ms / 10;
-            session.segments.push_back(seg);
-
-            LOG("SEGMENT session=%s index=%d t0=%lld t1=%lld text=\"%s\" (silence flush)",
-                session.session_id.c_str(), seg.index, (long long)seg.t0, (long long)seg.t1, seg.text.c_str());
-
-            session.current_text.clear();
-        }
-
-        session.active_speech = false;
-        session.n_iter = 0;
-
-        // Keep only minimal audio for next speech detection
-        int n_samples_keep = ms_to_samples(params.keep_ms);
-        if ((int)session.pcmf32.size() > n_samples_keep) {
-            session.pcmf32_old.assign(
-                session.pcmf32.end() - n_samples_keep,
-                session.pcmf32.end()
-            );
-        }
-    }
-
-    if (session.active_speech || speech_detected) {
-        int audio_ms = (int)(session.pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE);
-        LOG("INFER session=%s iter=%d audio=%dms vad=%s active=%s silent_chunks=%d",
-            session.session_id.c_str(), session.n_iter, audio_ms,
-            speech_detected ? "speech" : "silent", session.active_speech ? "yes" : "no",
-            session.silent_chunks);
-
-        // Run inference
-        std::lock_guard<std::mutex> lock(whisper_mutex);
-
-        whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        wparams.print_realtime = false;
-        wparams.print_progress = false;
-        wparams.print_timestamps = false;
-        wparams.print_special = false;
-        wparams.translate = session.translate;
-        wparams.language = session.language.c_str();
-        wparams.n_threads = params.n_threads;
-        wparams.single_segment = true;
-        wparams.no_context = true;
-
-        auto t_start = std::chrono::high_resolution_clock::now();
-
-        if (whisper_full(ctx, wparams, session.pcmf32.data(), session.pcmf32.size()) == 0) {
-            auto t_end = std::chrono::high_resolution_clock::now();
-            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-
-            // Extract results
-            std::string text;
-            const int n_segments = whisper_full_n_segments(ctx);
-            for (int i = 0; i < n_segments; ++i) {
-                text += whisper_full_get_segment_text(ctx, i);
-            }
-
-            session.current_text = text;
-            session.current_t0 = (session.stream_ms - (int)(session.pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE)) / 10;
-
-            LOG("INFER session=%s DONE time=%lldms text_len=%zu text=\"%.50s%s\"",
-                session.session_id.c_str(), (long long)duration_ms, text.length(),
-                text.c_str(), text.length() > 50 ? "..." : "");
-        } else {
-            LOG("INFER session=%s FAILED", session.session_id.c_str());
-        }
-
-        session.n_iter++;
-        session.active_speech = true;
-
-        // Flush segment periodically
-        if (session.n_iter % n_new_line == 0) {
-            if (!session.current_text.empty()) {
-                TranscriptSegment seg;
-                seg.index = session.segments.size();
-                seg.text = session.current_text;
-                seg.t0 = session.current_t0;
-                seg.t1 = session.stream_ms / 10;
-                session.segments.push_back(seg);
-
-                LOG("SEGMENT session=%s index=%d t0=%lld t1=%lld text=\"%s\"",
-                    session.session_id.c_str(), seg.index, (long long)seg.t0, (long long)seg.t1, seg.text.c_str());
-            }
-
-            // Keep tail of audio for next iteration
-            session.pcmf32_old.assign(
-                session.pcmf32.end() - std::min((int)session.pcmf32.size(), n_samples_keep),
-                session.pcmf32.end()
-            );
-
-            session.current_text.clear();
-            session.active_speech = false;
-        }
-    }
+    session.n_iter++;
 
     // Clear new audio buffer
     session.pcmf32_new.clear();

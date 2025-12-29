@@ -3,13 +3,46 @@
 ## Commands
 
 ```bash
-# SRT output for comparison
+# Start the HTTP server with VAD improvements
+./build/bin/whisper-streamserver \
+    -m models/ggml-medium.bin \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --vad-threshold 0.5 \
+    --vad-min-speech 250 \
+    --vad-min-silence 100 \
+    --vad-max-speech 5000 \
+    --inference-interval 1000 \
+    --step 500 \
+    --host 127.0.0.1 \
+    --port 8080
+```
+
+```bash
+# Test with Chinese audio
 ./build/bin/whisper-streamserver \
     -m models/ggml-medium.bin \
     --vad-model models/ggml-silero-v6.2.0.bin \
     -f samples/recording-zh-xiaogao-jie.wav \
     -l zh \
+    --output-srt \
+    --vad-debug
+
+# Test with English audio
+./build/bin/whisper-streamserver \
+    -m models/ggml-medium.bin \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    -f samples/jfk.wav \
+    -l en \
     --output-srt
+
+# With shorter max segment duration (3s) for finer segmentation
+./build/bin/whisper-streamserver \
+    -m models/ggml-medium.bin \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    -f samples/recording-zh-xiaogao-jie.wav \
+    -l zh \
+    --output-srt \
+    --vad-max-speech 3000
 ```
 
 ## Background
