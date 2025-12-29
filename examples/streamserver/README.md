@@ -25,6 +25,15 @@ The binary will be at `build/bin/whisper-streamserver`.
 
 ```bash
 ./build/bin/whisper-streamserver -m models/ggml-base.bin
+
+# Disable VAD completely
+./build/bin/whisper-streamserver -m models/ggml-base.bin --no-vad
+
+# Debug VAD to see energy values
+./build/bin/whisper-streamserver -m models/ggml-base.bin --vad-debug
+
+# Adjust threshold (default is 0.01, try lower values like 0.001)
+./build/bin/whisper-streamserver -m models/ggml-base.bin --vad-thold 0.001
 ```
 
 ### Command-line Options

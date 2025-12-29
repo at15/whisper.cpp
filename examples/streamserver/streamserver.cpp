@@ -28,8 +28,20 @@
 using namespace httplib;
 using json = nlohmann::ordered_json;
 
-// Log macro for debugging
-#define LOG(fmt, ...) fprintf(stderr, "[streamserver] " fmt "\n", ##__VA_ARGS__)
+// Log macro with timestamp
+inline std::string get_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&time));
+    char result[64];
+    snprintf(result, sizeof(result), "%s.%03d", buf, (int)ms.count());
+    return std::string(result);
+}
+
+#define LOG(fmt, ...) fprintf(stderr, "[%s] " fmt "\n", get_timestamp().c_str(), ##__VA_ARGS__)
 
 namespace {
 
@@ -65,6 +77,8 @@ struct whisper_params {
     // VAD parameters
     float vad_thold = 0.01f;    // Energy threshold for VAD
     float freq_thold = 100.0f;  // High-pass filter cutoff Hz
+    bool no_vad = false;        // Disable VAD, always run inference
+    bool vad_debug = false;     // Log VAD energy values
 
     bool use_gpu = true;
     bool flash_attn = true;
@@ -103,6 +117,7 @@ struct StreamSession {
     int stream_ms = 0;
     bool active_speech = false;
     int n_iter = 0;
+    int silent_chunks = 0;  // Count consecutive silent chunks
 };
 
 // Global state
@@ -115,8 +130,8 @@ inline int ms_to_samples(int ms, int sample_rate = WHISPER_SAMPLE_RATE) {
     return (sample_rate * ms) / 1000;
 }
 
-// Simple energy-based VAD
-bool is_speech(const std::vector<float>& pcmf32, float energy_thold = 0.01f, float freq_thold = 100.0f) {
+// Simple energy-based VAD with additional checks
+bool is_speech(const std::vector<float>& pcmf32, float energy_thold = 0.01f, float freq_thold = 100.0f, bool verbose = false) {
     if (pcmf32.empty()) {
         return false;
     }
@@ -135,7 +150,28 @@ bool is_speech(const std::vector<float>& pcmf32, float energy_thold = 0.01f, flo
     }
     energy = std::sqrt(energy / filtered.size());
 
-    return energy > energy_thold;
+    // Also check peak amplitude - speech typically has higher peaks than noise
+    float peak = 0.0f;
+    for (const auto& sample : filtered) {
+        float abs_sample = std::fabs(sample);
+        if (abs_sample > peak) {
+            peak = abs_sample;
+        }
+    }
+
+    // Speech typically has peak-to-RMS ratio (crest factor) > 3
+    // and absolute peak > 0.01 for real speech
+    float crest_factor = (energy > 0.0001f) ? (peak / energy) : 0.0f;
+    bool has_speech_characteristics = (peak > 0.02f) || (energy > energy_thold && crest_factor > 2.5f);
+
+    bool is_detected = energy > energy_thold && has_speech_characteristics;
+
+    if (verbose) {
+        LOG("VAD energy=%.6f peak=%.4f crest=%.2f thold=%.6f detected=%s",
+            energy, peak, crest_factor, energy_thold, is_detected ? "yes" : "no");
+    }
+
+    return is_detected;
 }
 
 void print_usage(int argc, char** argv, const whisper_params& params, const server_params& sparams) {
@@ -151,6 +187,8 @@ void print_usage(int argc, char** argv, const whisper_params& params, const serv
     fprintf(stderr, "  --length N                 [%-7d] max audio chunk for inference in ms\n", params.length_ms);
     fprintf(stderr, "  --vad-thold N              [%-7.3f] VAD energy threshold\n", params.vad_thold);
     fprintf(stderr, "  --freq-thold N             [%-7.1f] high-pass filter cutoff Hz\n", params.freq_thold);
+    fprintf(stderr, "  --no-vad                   [%-7s] disable VAD, always run inference\n", params.no_vad ? "true" : "false");
+    fprintf(stderr, "  --vad-debug                [%-7s] log VAD energy values for debugging\n", params.vad_debug ? "true" : "false");
     fprintf(stderr, "  --host HOST                [%-7s] hostname\n", sparams.hostname.c_str());
     fprintf(stderr, "  --port PORT                [%-7d] port\n", sparams.port);
     fprintf(stderr, "  --timeout N                [%-7d] session timeout in seconds\n", sparams.session_timeout_s);
@@ -179,6 +217,10 @@ bool parse_params(int argc, char** argv, whisper_params& params, server_params& 
             params.vad_thold = std::stof(argv[++i]);
         } else if (arg == "--freq-thold") {
             params.freq_thold = std::stof(argv[++i]);
+        } else if (arg == "--no-vad") {
+            params.no_vad = true;
+        } else if (arg == "--vad-debug") {
+            params.vad_debug = true;
         } else if (arg == "--host") {
             sparams.hostname = argv[++i];
         } else if (arg == "--port") {
@@ -234,9 +276,56 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
     session.pcmf32_old = session.pcmf32;
 
     // VAD check
-    if (session.active_speech || is_speech(session.pcmf32, params.vad_thold, params.freq_thold)) {
-        LOG("Session %s: speech detected, running inference (iter=%d, samples=%zu)",
-            session.session_id.c_str(), session.n_iter, session.pcmf32.size());
+    bool speech_detected = params.no_vad ? true : is_speech(session.pcmf32, params.vad_thold, params.freq_thold, params.vad_debug);
+
+    // Track consecutive silent chunks to reset active_speech
+    if (speech_detected) {
+        session.silent_chunks = 0;
+    } else {
+        session.silent_chunks++;
+    }
+
+    // Reset active_speech after 3 consecutive silent chunks (1.5s of silence at 500ms step)
+    // This prevents hallucinations during extended silence
+    const int max_silent_chunks = 3;
+    if (session.active_speech && session.silent_chunks >= max_silent_chunks) {
+        LOG("VAD session=%s resetting active_speech after %d silent chunks",
+            session.session_id.c_str(), session.silent_chunks);
+
+        // Flush any pending transcription as a segment before resetting
+        if (!session.current_text.empty()) {
+            TranscriptSegment seg;
+            seg.index = session.segments.size();
+            seg.text = session.current_text;
+            seg.t0 = session.current_t0;
+            seg.t1 = session.stream_ms / 10;
+            session.segments.push_back(seg);
+
+            LOG("SEGMENT session=%s index=%d t0=%lld t1=%lld text=\"%s\" (silence flush)",
+                session.session_id.c_str(), seg.index, (long long)seg.t0, (long long)seg.t1, seg.text.c_str());
+
+            session.current_text.clear();
+        }
+
+        session.active_speech = false;
+        session.n_iter = 0;
+
+        // Keep only minimal audio for next speech detection
+        int n_samples_keep = ms_to_samples(params.keep_ms);
+        if ((int)session.pcmf32.size() > n_samples_keep) {
+            session.pcmf32_old.assign(
+                session.pcmf32.end() - n_samples_keep,
+                session.pcmf32.end()
+            );
+        }
+    }
+
+    if (session.active_speech || speech_detected) {
+        int audio_ms = (int)(session.pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE);
+        LOG("INFER session=%s iter=%d audio=%dms vad=%s active=%s silent_chunks=%d",
+            session.session_id.c_str(), session.n_iter, audio_ms,
+            speech_detected ? "speech" : "silent", session.active_speech ? "yes" : "no",
+            session.silent_chunks);
 
         // Run inference
         std::lock_guard<std::mutex> lock(whisper_mutex);
@@ -252,7 +341,12 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
         wparams.single_segment = true;
         wparams.no_context = true;
 
+        auto t_start = std::chrono::high_resolution_clock::now();
+
         if (whisper_full(ctx, wparams, session.pcmf32.data(), session.pcmf32.size()) == 0) {
+            auto t_end = std::chrono::high_resolution_clock::now();
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
             // Extract results
             std::string text;
             const int n_segments = whisper_full_n_segments(ctx);
@@ -263,9 +357,11 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
             session.current_text = text;
             session.current_t0 = (session.stream_ms - (int)(session.pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE)) / 10;
 
-            LOG("Session %s: transcribed: %s", session.session_id.c_str(), text.c_str());
+            LOG("INFER session=%s DONE time=%lldms text_len=%zu text=\"%.50s%s\"",
+                session.session_id.c_str(), (long long)duration_ms, text.length(),
+                text.c_str(), text.length() > 50 ? "..." : "");
         } else {
-            LOG("Session %s: inference failed", session.session_id.c_str());
+            LOG("INFER session=%s FAILED", session.session_id.c_str());
         }
 
         session.n_iter++;
@@ -281,8 +377,8 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
                 seg.t1 = session.stream_ms / 10;
                 session.segments.push_back(seg);
 
-                LOG("Session %s: segment %d finalized: %s",
-                    session.session_id.c_str(), seg.index, seg.text.c_str());
+                LOG("SEGMENT session=%s index=%d t0=%lld t1=%lld text=\"%s\"",
+                    session.session_id.c_str(), seg.index, (long long)seg.t0, (long long)seg.t1, seg.text.c_str());
             }
 
             // Keep tail of audio for next iteration
@@ -314,7 +410,9 @@ void cleanup_expired_sessions(int timeout_s, std::atomic<bool>& running) {
             ).count();
 
             if (elapsed > timeout_s) {
-                LOG("Session %s expired after %lld seconds", it->first.c_str(), (long long)elapsed);
+                LOG("EXPIRE session=%s idle=%llds segments=%zu duration=%dms",
+                    it->first.c_str(), (long long)elapsed,
+                    it->second.segments.size(), it->second.stream_ms);
                 it = sessions.erase(it);
             } else {
                 ++it;
@@ -337,7 +435,7 @@ int main(int argc, char** argv) {
     params.keep_ms = std::min(params.keep_ms, params.step_ms);
     params.length_ms = std::max(params.length_ms, params.step_ms);
 
-    LOG("Loading model: %s", params.model.c_str());
+    LOG("MODEL loading: %s", params.model.c_str());
 
     // Initialize whisper context
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -350,7 +448,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    LOG("Model loaded successfully");
+    LOG("MODEL loaded successfully");
 
     // Create HTTP server
     auto svr = std::make_unique<httplib::Server>();
@@ -403,7 +501,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(sessions_mutex);
 
         if (sessions.find(session_id) != sessions.end()) {
-            LOG("Session %s already exists", session_id.c_str());
+            LOG("CREATE session=%s REJECTED (already exists)", session_id.c_str());
             res.status = 409;
             res.set_content(R"({"status":"error","message":"session already exists"})", "application/json");
             return;
@@ -417,7 +515,7 @@ int main(int argc, char** argv) {
 
         sessions[session_id] = std::move(session);
 
-        LOG("Session %s created (language=%s, translate=%s)",
+        LOG("CREATE session=%s language=%s translate=%s",
             session_id.c_str(), language.c_str(), translate ? "true" : "false");
 
         json response = {
@@ -439,12 +537,14 @@ int main(int argc, char** argv) {
         if (req.has_param("chunk_id")) chunk_id = std::stoi(req.get_param_value("chunk_id"));
 
         if (session_id.empty()) {
+            LOG("PUSH REJECTED (missing session_id)");
             res.status = 400;
             res.set_content(R"({"status":"error","message":"session_id is required"})", "application/json");
             return;
         }
 
         if (!req.has_file("file")) {
+            LOG("PUSH session=%s chunk=%d REJECTED (missing file)", session_id.c_str(), chunk_id);
             res.status = 400;
             res.set_content(R"({"status":"error","message":"file is required"})", "application/json");
             return;
@@ -457,7 +557,7 @@ int main(int argc, char** argv) {
 
         auto it = sessions.find(session_id);
         if (it == sessions.end()) {
-            LOG("Session %s not found, push rejected (chunk_id=%d)", session_id.c_str(), chunk_id);
+            LOG("PUSH session=%s chunk=%d REJECTED (not found)", session_id.c_str(), chunk_id);
             res.status = 404;
             res.set_content(R"({"status":"error","message":"session not found or expired"})", "application/json");
             return;
@@ -467,7 +567,7 @@ int main(int argc, char** argv) {
 
         // Check chunk ordering
         if (chunk_id >= 0 && chunk_id <= session.last_chunk_id) {
-            LOG("Session %s: duplicate or out-of-order chunk %d (last=%d)",
+            LOG("PUSH session=%s chunk=%d WARNING (duplicate/out-of-order, last=%d)",
                 session_id.c_str(), chunk_id, session.last_chunk_id);
         }
 
@@ -476,20 +576,23 @@ int main(int argc, char** argv) {
         std::vector<std::vector<float>> pcmf32s;
 
         if (!::read_audio_data(audio_file.content, pcmf32, pcmf32s, false)) {
-            LOG("Session %s: failed to parse audio data", session_id.c_str());
+            LOG("PUSH session=%s chunk=%d REJECTED (invalid audio, size=%zu bytes)",
+                session_id.c_str(), chunk_id, audio_file.content.size());
             res.status = 400;
             res.set_content(R"({"status":"error","message":"failed to parse audio data"})", "application/json");
             return;
         }
 
         // Append to session buffer
+        int audio_ms = (int)(pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE);
         session.pcmf32_new.insert(session.pcmf32_new.end(), pcmf32.begin(), pcmf32.end());
-        session.stream_ms += (int)(pcmf32.size() * 1000 / WHISPER_SAMPLE_RATE);
+        session.stream_ms += audio_ms;
         session.last_chunk_id = chunk_id;
         session.last_activity = std::chrono::steady_clock::now();
 
-        LOG("Session %s: received chunk %d (%zu samples, total=%dms)",
-            session_id.c_str(), chunk_id, pcmf32.size(), session.stream_ms);
+        LOG("PUSH session=%s chunk=%d audio=%dms total=%dms buffer=%dms",
+            session_id.c_str(), chunk_id, audio_ms, session.stream_ms,
+            (int)(session.pcmf32_new.size() * 1000 / WHISPER_SAMPLE_RATE));
 
         // Process audio if we have enough
         process_session_audio(session, ctx, params);
@@ -521,6 +624,7 @@ int main(int argc, char** argv) {
 
         auto it = sessions.find(session_id);
         if (it == sessions.end()) {
+            LOG("POLL session=%s REJECTED (not found)", session_id.c_str());
             res.status = 404;
             res.set_content(R"({"status":"error","message":"session not found or expired"})", "application/json");
             return;
@@ -536,6 +640,7 @@ int main(int argc, char** argv) {
         };
 
         // Add segments after the specified index
+        int new_segments = 0;
         for (const auto& seg : session.segments) {
             if (seg.index > after_index) {
                 response["segments"].push_back({
@@ -544,16 +649,22 @@ int main(int argc, char** argv) {
                     {"t0", seg.t0},
                     {"t1", seg.t1}
                 });
+                new_segments++;
             }
         }
 
         // Add current partial transcription
-        if (!session.current_text.empty()) {
+        bool has_current = !session.current_text.empty();
+        if (has_current) {
             response["current"] = {
                 {"text", session.current_text},
                 {"t0", session.current_t0}
             };
         }
+
+        LOG("POLL session=%s after=%d segments=%d/%zu current=%s speaking=%s",
+            session_id.c_str(), after_index, new_segments, session.segments.size(),
+            has_current ? "yes" : "no", session.active_speech ? "yes" : "no");
 
         res.set_content(response.dump(), "application/json");
     });
@@ -566,6 +677,7 @@ int main(int argc, char** argv) {
 
         auto it = sessions.find(session_id);
         if (it == sessions.end()) {
+            LOG("CLOSE session=%s REJECTED (not found)", session_id.c_str());
             res.status = 404;
             res.set_content(R"({"status":"error","message":"session not found or expired"})", "application/json");
             return;
@@ -600,7 +712,8 @@ int main(int argc, char** argv) {
             });
         }
 
-        LOG("Session %s closed, %zu segments", session_id.c_str(), response["segments"].size());
+        LOG("CLOSE session=%s duration=%dms segments=%zu",
+            session_id.c_str(), session.stream_ms, response["segments"].size());
 
         sessions.erase(it);
 
@@ -636,9 +749,10 @@ int main(int argc, char** argv) {
 #endif
 
     // Start server
-    LOG("Starting server on %s:%d", sparams.hostname.c_str(), sparams.port);
-    LOG("Parameters: step=%dms, keep=%dms, length=%dms, vad_thold=%.3f",
-        params.step_ms, params.keep_ms, params.length_ms, params.vad_thold);
+    LOG("SERVER starting on %s:%d", sparams.hostname.c_str(), sparams.port);
+    LOG("SERVER params: step=%dms keep=%dms length=%dms vad_thold=%.3f no_vad=%s timeout=%ds",
+        params.step_ms, params.keep_ms, params.length_ms, params.vad_thold,
+        params.no_vad ? "true" : "false", sparams.session_timeout_s);
 
     svr->set_read_timeout(sparams.read_timeout);
     svr->set_write_timeout(sparams.write_timeout);
@@ -656,7 +770,7 @@ int main(int argc, char** argv) {
     });
 
     svr->wait_until_ready();
-    LOG("Server is ready");
+    LOG("SERVER ready");
 
     server_thread.join();
 
@@ -665,6 +779,6 @@ int main(int argc, char** argv) {
     cleanup_thread.join();
     whisper_free(ctx);
 
-    LOG("Server stopped");
+    LOG("SERVER stopped");
     return 0;
 }
