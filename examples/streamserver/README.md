@@ -34,6 +34,9 @@ The binary will be at `build/bin/whisper-streamserver`.
 
 # Adjust threshold (default is 0.01, try lower values like 0.001)
 ./build/bin/whisper-streamserver -m models/ggml-base.bin --vad-thold 0.001
+
+# Use Silero VAD model
+./build/bin/whisper-streamserver -m models/ggml-base.bin --vad-model models/ggml-silero-v6.2.0.bin --vad-debug
 ```
 
 ### Command-line Options

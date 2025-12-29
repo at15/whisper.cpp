@@ -74,11 +74,15 @@ struct whisper_params {
     int32_t keep_ms = 200;      // Overlap from previous chunk
     int32_t length_ms = 10000;  // Max audio chunk for inference
 
-    // VAD parameters
-    float vad_thold = 0.01f;    // Energy threshold for VAD
+    // VAD parameters (energy-based fallback)
+    float vad_thold = 0.01f;    // Energy threshold for VAD (used when no VAD model)
     float freq_thold = 100.0f;  // High-pass filter cutoff Hz
     bool no_vad = false;        // Disable VAD, always run inference
     bool vad_debug = false;     // Log VAD energy values
+
+    // VAD model parameters (Silero VAD)
+    std::string vad_model = "";         // Path to VAD model (empty = use energy-based)
+    float vad_threshold = 0.5f;         // VAD model probability threshold
 
     bool use_gpu = true;
     bool flash_attn = true;
@@ -124,14 +128,63 @@ struct StreamSession {
 std::unordered_map<std::string, StreamSession> sessions;
 std::mutex sessions_mutex;
 std::mutex whisper_mutex;
+std::mutex vad_mutex;  // Protect VAD context access
+
+// Global VAD context (optional, loaded if --vad-model specified)
+whisper_vad_context* g_vad_ctx = nullptr;
 
 // Calculate number of samples from milliseconds
 inline int ms_to_samples(int ms, int sample_rate = WHISPER_SAMPLE_RATE) {
     return (sample_rate * ms) / 1000;
 }
 
-// Simple energy-based VAD with additional checks
-bool is_speech(const std::vector<float>& pcmf32, float energy_thold = 0.01f, float freq_thold = 100.0f, bool verbose = false) {
+// Model-based VAD using Silero VAD
+bool is_speech_model(const std::vector<float>& pcmf32, float threshold = 0.5f, bool verbose = false) {
+    if (pcmf32.empty() || g_vad_ctx == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(vad_mutex);
+
+    // Run VAD detection
+    if (!whisper_vad_detect_speech(g_vad_ctx, pcmf32.data(), pcmf32.size())) {
+        if (verbose) {
+            LOG("VAD model: detection failed");
+        }
+        return false;
+    }
+
+    // Get probabilities and check if any frame exceeds threshold
+    int n_probs = whisper_vad_n_probs(g_vad_ctx);
+    float* probs = whisper_vad_probs(g_vad_ctx);
+
+    if (n_probs == 0 || probs == nullptr) {
+        return false;
+    }
+
+    // Calculate average and max probability
+    float max_prob = 0.0f;
+    float avg_prob = 0.0f;
+    for (int i = 0; i < n_probs; i++) {
+        if (probs[i] > max_prob) {
+            max_prob = probs[i];
+        }
+        avg_prob += probs[i];
+    }
+    avg_prob /= n_probs;
+
+    bool is_detected = max_prob > threshold;
+
+    if (verbose) {
+        LOG("VAD model: n_probs=%d avg=%.3f max=%.3f thold=%.3f detected=%s",
+            n_probs, avg_prob, max_prob, threshold, is_detected ? "yes" : "no");
+    }
+
+    return is_detected;
+}
+
+// Simple energy-based VAD with additional checks (fallback when no model)
+bool is_speech_energy(const std::vector<float>& pcmf32, float energy_thold = 0.01f, float freq_thold = 100.0f, bool verbose = false) {
     if (pcmf32.empty()) {
         return false;
     }
@@ -174,6 +227,15 @@ bool is_speech(const std::vector<float>& pcmf32, float energy_thold = 0.01f, flo
     return is_detected;
 }
 
+// Combined VAD function - uses model if available, falls back to energy-based
+bool is_speech(const std::vector<float>& pcmf32, const whisper_params& params) {
+    if (g_vad_ctx != nullptr) {
+        return is_speech_model(pcmf32, params.vad_threshold, params.vad_debug);
+    } else {
+        return is_speech_energy(pcmf32, params.vad_thold, params.freq_thold, params.vad_debug);
+    }
+}
+
 void print_usage(int argc, char** argv, const whisper_params& params, const server_params& sparams) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
@@ -185,10 +247,17 @@ void print_usage(int argc, char** argv, const whisper_params& params, const serv
     fprintf(stderr, "  --step N                   [%-7d] process every N ms of new audio\n", params.step_ms);
     fprintf(stderr, "  --keep N                   [%-7d] overlap from previous chunk in ms\n", params.keep_ms);
     fprintf(stderr, "  --length N                 [%-7d] max audio chunk for inference in ms\n", params.length_ms);
-    fprintf(stderr, "  --vad-thold N              [%-7.3f] VAD energy threshold\n", params.vad_thold);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "VAD options:\n");
+    fprintf(stderr, "  --vad-model FNAME          [%-7s] VAD model path (Silero). If empty, use energy-based VAD\n",
+            params.vad_model.empty() ? "none" : params.vad_model.c_str());
+    fprintf(stderr, "  --vad-threshold N          [%-7.2f] VAD model probability threshold (0.0-1.0)\n", params.vad_threshold);
+    fprintf(stderr, "  --vad-thold N              [%-7.3f] energy-based VAD threshold (fallback)\n", params.vad_thold);
     fprintf(stderr, "  --freq-thold N             [%-7.1f] high-pass filter cutoff Hz\n", params.freq_thold);
     fprintf(stderr, "  --no-vad                   [%-7s] disable VAD, always run inference\n", params.no_vad ? "true" : "false");
-    fprintf(stderr, "  --vad-debug                [%-7s] log VAD energy values for debugging\n", params.vad_debug ? "true" : "false");
+    fprintf(stderr, "  --vad-debug                [%-7s] log VAD values for debugging\n", params.vad_debug ? "true" : "false");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Server options:\n");
     fprintf(stderr, "  --host HOST                [%-7s] hostname\n", sparams.hostname.c_str());
     fprintf(stderr, "  --port PORT                [%-7d] port\n", sparams.port);
     fprintf(stderr, "  --timeout N                [%-7d] session timeout in seconds\n", sparams.session_timeout_s);
@@ -213,6 +282,10 @@ bool parse_params(int argc, char** argv, whisper_params& params, server_params& 
             params.keep_ms = std::stoi(argv[++i]);
         } else if (arg == "--length") {
             params.length_ms = std::stoi(argv[++i]);
+        } else if (arg == "--vad-model") {
+            params.vad_model = argv[++i];
+        } else if (arg == "--vad-threshold") {
+            params.vad_threshold = std::stof(argv[++i]);
         } else if (arg == "--vad-thold") {
             params.vad_thold = std::stof(argv[++i]);
         } else if (arg == "--freq-thold") {
@@ -275,8 +348,9 @@ void process_session_audio(StreamSession& session, whisper_context* ctx, const w
 
     session.pcmf32_old = session.pcmf32;
 
-    // VAD check
-    bool speech_detected = params.no_vad ? true : is_speech(session.pcmf32, params.vad_thold, params.freq_thold, params.vad_debug);
+    // VAD check - run on new audio only (not the entire accumulated buffer)
+    // This keeps VAD processing time constant (~100ms for 500ms of audio)
+    bool speech_detected = params.no_vad ? true : is_speech(session.pcmf32_new, params);
 
     // Track consecutive silent chunks to reset active_speech
     if (speech_detected) {
@@ -449,6 +523,25 @@ int main(int argc, char** argv) {
     }
 
     LOG("MODEL loaded successfully");
+
+    // Initialize VAD model if specified
+    // Note: VAD model runs on CPU by default (GPU support is experimental for Silero VAD)
+    if (!params.vad_model.empty()) {
+        LOG("VAD loading: %s", params.vad_model.c_str());
+
+        struct whisper_vad_context_params vad_cparams = whisper_vad_default_context_params();
+        vad_cparams.n_threads = params.n_threads;
+        vad_cparams.use_gpu = false;  // VAD model runs on CPU (GPU has compatibility issues)
+
+        g_vad_ctx = whisper_vad_init_from_file_with_params(params.vad_model.c_str(), vad_cparams);
+        if (g_vad_ctx == nullptr) {
+            LOG("Failed to initialize VAD model, falling back to energy-based VAD");
+        } else {
+            LOG("VAD loaded successfully (threshold=%.2f, cpu-only)", params.vad_threshold);
+        }
+    } else {
+        LOG("VAD using energy-based detection (thold=%.4f)", params.vad_thold);
+    }
 
     // Create HTTP server
     auto svr = std::make_unique<httplib::Server>();
@@ -761,6 +854,7 @@ int main(int argc, char** argv) {
         LOG("Failed to bind to %s:%d", sparams.hostname.c_str(), sparams.port);
         cleanup_running = false;
         cleanup_thread.join();
+        if (g_vad_ctx) whisper_vad_free(g_vad_ctx);
         whisper_free(ctx);
         return 1;
     }
@@ -777,6 +871,10 @@ int main(int argc, char** argv) {
     // Cleanup
     cleanup_running = false;
     cleanup_thread.join();
+    if (g_vad_ctx) {
+        whisper_vad_free(g_vad_ctx);
+        g_vad_ctx = nullptr;
+    }
     whisper_free(ctx);
 
     LOG("SERVER stopped");
