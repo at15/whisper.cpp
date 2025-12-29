@@ -2,9 +2,6 @@
 
 ## Commands
 
-I also realized the processing time seems to be much longer.
-i.e. the processing time for current window is longer than the wait time for next client request.
-
 ```bash
 # SRT output for comparison
 ./build/bin/whisper-streamserver \
@@ -51,3 +48,11 @@ I want to you to do the following:
   - the cli should be able to read from local audio file and simulate a streaming input.
   - Output the result with timestamp so we can compare it with `whisper-cli`'s output
 - Improve the stream server's logic by iterating on the cli, the cli and server should share the same logic
+
+## Issue found when using the cli
+
+- Our VAD is a lot worse than `whisper-cli`'s VAD
+- Our processing time (when using the cli) is way longer than `whisper-cli`, meaning we cannot keep up with the streaming input
+  - You can add log the time we spent, what I observed is the processing time for current window is longer than the interval for next client request.
+
+We should consider switch to whisper-cli's approach to do better VAD and stream processing.
