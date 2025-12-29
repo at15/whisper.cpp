@@ -42,6 +42,38 @@ The binary will be at `build/bin/whisper-streamserver`.
 ./build/bin/whisper-streamserver -m models/ggml-medium.bin --vad-model models/ggml-silero-v6.2.0.bin --vad-debug
 ```
 
+### CLI Mode (for testing)
+
+Test transcription with local audio files without running the HTTP server:
+
+```bash
+# Basic CLI mode with timestamps
+./build/bin/whisper-streamserver \
+    -m models/ggml-medium.bin \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    -f samples/recording-zh-xiaogao-jie.wav \
+    -l zh
+
+# Output in SRT format for comparison with whisper-cli
+./build/bin/whisper-streamserver \
+    -m models/ggml-medium.bin \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    -f samples/recording-zh-xiaogao-jie.wav \
+    -l zh \
+    --output-srt
+
+# Compare with whisper-cli output
+./build/bin/whisper-cli \
+    --file samples/recording-zh-xiaogao-jie.wav \
+    --model models/ggml-medium.bin \
+    --language zh \
+    --vad \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --output-srt
+```
+
+CLI mode simulates streaming by chunking the audio file at 500ms intervals (configurable via `--step`), processing each chunk through the same VAD and transcription pipeline as the HTTP server.
+
 ### Command-line Options
 
 | Option | Default | Description |
@@ -51,12 +83,19 @@ The binary will be at `build/bin/whisper-streamserver`.
 | `--step N` | 500 | Process every N ms of new audio |
 | `--keep N` | 200 | Overlap from previous chunk in ms |
 | `--length N` | 10000 | Max audio chunk for inference in ms |
-| `--vad-thold N` | 0.01 | VAD energy threshold |
+| `--vad-model FNAME` | - | VAD model path (Silero) |
+| `--vad-threshold N` | 0.5 | VAD model probability threshold |
+| `--vad-thold N` | 0.01 | VAD energy threshold (fallback) |
 | `--freq-thold N` | 100.0 | High-pass filter cutoff Hz |
-| `--host HOST` | 127.0.0.1 | Hostname |
-| `--port PORT` | 8080 | Port |
-| `--timeout N` | 60 | Session timeout in seconds |
+| `--no-vad` | false | Disable VAD, always run inference |
+| `--vad-debug` | false | Log VAD values for debugging |
+| `--host HOST` | 127.0.0.1 | Hostname (server mode) |
+| `--port PORT` | 8080 | Port (server mode) |
+| `--timeout N` | 60 | Session timeout in seconds (server mode) |
 | `-ng, --no-gpu` | - | Disable GPU |
+| `-f FNAME, --file FNAME` | - | Input audio file (enables CLI mode) |
+| `-l LANG, --language LANG` | auto | Source language (e.g., en, zh, ja) |
+| `--output-srt` | false | Output in SRT subtitle format |
 
 ## API Reference
 

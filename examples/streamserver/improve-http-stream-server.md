@@ -1,5 +1,20 @@
 # Improve HTTP Stream Server
 
+## Commands
+
+I also realized the processing time seems to be much longer.
+i.e. the processing time for current window is longer than the wait time for next client request.
+
+```bash
+# SRT output for comparison
+./build/bin/whisper-streamserver \
+    -m models/ggml-medium.bin \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    -f samples/recording-zh-xiaogao-jie.wav \
+    -l zh \
+    --output-srt
+```
+
 ## Background
 
 Right now we don't have any test for our http stream server.
@@ -17,6 +32,14 @@ than our stream server for the Chinese sample audio I added.
     --file samples/recording-zh-xiaogao-jie.wav \
     --model models/ggml-medium.bin \
     --language zh \
+    --vad \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --output-srt
+# Japanese
+./build/bin/whisper-cli \
+    --file samples/recording-ja-anime.wav \
+    --model models/ggml-medium.bin \
+    --language ja \
     --vad \
     --vad-model models/ggml-silero-v6.2.0.bin \
     --output-srt

@@ -88,6 +88,11 @@ struct whisper_params {
     bool flash_attn = true;
 
     std::string model = "models/ggml-base.en.bin";
+
+    // CLI mode parameters
+    std::string input_file = "";     // --file or -f (enables CLI mode)
+    std::string language = "auto";   // --language or -l
+    bool output_srt = false;         // --output-srt
 };
 
 // Transcript segment
@@ -263,6 +268,11 @@ void print_usage(int argc, char** argv, const whisper_params& params, const serv
     fprintf(stderr, "  --timeout N                [%-7d] session timeout in seconds\n", sparams.session_timeout_s);
     fprintf(stderr, "  -ng,      --no-gpu         disable GPU\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "CLI mode options (for testing without server):\n");
+    fprintf(stderr, "  -f FNAME, --file FNAME     input audio file (enables CLI mode)\n");
+    fprintf(stderr, "  -l LANG,  --language LANG  [%-7s] source language (e.g., en, zh, ja, auto)\n", params.language.c_str());
+    fprintf(stderr, "  --output-srt               [%-7s] output in SRT subtitle format\n", params.output_srt ? "true" : "false");
+    fprintf(stderr, "\n");
 }
 
 bool parse_params(int argc, char** argv, whisper_params& params, server_params& sparams) {
@@ -302,6 +312,12 @@ bool parse_params(int argc, char** argv, whisper_params& params, server_params& 
             sparams.session_timeout_s = std::stoi(argv[++i]);
         } else if (arg == "-ng" || arg == "--no-gpu") {
             params.use_gpu = false;
+        } else if (arg == "-f" || arg == "--file") {
+            params.input_file = argv[++i];
+        } else if (arg == "-l" || arg == "--language") {
+            params.language = argv[++i];
+        } else if (arg == "--output-srt") {
+            params.output_srt = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv, params, sparams);
@@ -309,6 +325,57 @@ bool parse_params(int argc, char** argv, whisper_params& params, server_params& 
         }
     }
     return true;
+}
+
+// Convert centiseconds to SRT timestamp format (HH:MM:SS,mmm)
+std::string to_timestamp_srt(int64_t cs) {
+    int64_t ms = cs * 10;  // centiseconds to milliseconds
+    int64_t hours = ms / (1000 * 60 * 60);
+    ms %= (1000 * 60 * 60);
+    int64_t minutes = ms / (1000 * 60);
+    ms %= (1000 * 60);
+    int64_t seconds = ms / 1000;
+    ms %= 1000;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d,%03d",
+        (int)hours, (int)minutes, (int)seconds, (int)ms);
+    return buf;
+}
+
+// Convert centiseconds to simple timestamp format (MM:SS.cc)
+std::string to_timestamp_simple(int64_t cs) {
+    int64_t minutes = cs / 6000;
+    cs %= 6000;
+    int64_t seconds = cs / 100;
+    int64_t centis = cs % 100;
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d:%02d.%02d",
+        (int)minutes, (int)seconds, (int)centis);
+    return buf;
+}
+
+// Output transcription results
+void output_results(const StreamSession& session, const whisper_params& params) {
+    if (params.output_srt) {
+        // SRT format
+        for (const auto& seg : session.segments) {
+            printf("%d\n", seg.index + 1);
+            printf("%s --> %s\n",
+                to_timestamp_srt(seg.t0).c_str(),
+                to_timestamp_srt(seg.t1).c_str());
+            printf("%s\n\n", seg.text.c_str());
+        }
+    } else {
+        // Plain text with timestamps
+        for (const auto& seg : session.segments) {
+            printf("[%s -> %s] %s\n",
+                to_timestamp_simple(seg.t0).c_str(),
+                to_timestamp_simple(seg.t1).c_str(),
+                seg.text.c_str());
+        }
+    }
 }
 
 // Process audio for a session and run inference if needed
@@ -495,6 +562,79 @@ void cleanup_expired_sessions(int timeout_s, std::atomic<bool>& running) {
     }
 }
 
+// CLI mode: process audio file with simulated streaming
+int run_cli_mode(whisper_context* ctx, const whisper_params& params) {
+    std::vector<float> pcmf32;
+    std::vector<std::vector<float>> pcmf32s;
+
+    LOG("CLI loading audio: %s", params.input_file.c_str());
+
+    if (!::read_audio_data(params.input_file, pcmf32, pcmf32s, false)) {
+        LOG("CLI failed to read audio file: %s", params.input_file.c_str());
+        return 1;
+    }
+
+    float duration_s = (float)pcmf32.size() / WHISPER_SAMPLE_RATE;
+    LOG("CLI audio loaded: %.1f seconds (%zu samples)", duration_s, pcmf32.size());
+
+    // Create session
+    StreamSession session;
+    session.session_id = "cli";
+    session.language = params.language;
+    session.translate = false;
+    session.last_activity = std::chrono::steady_clock::now();
+
+    // Simulate streaming input by chunking at step_ms intervals
+    const int n_samples_step = ms_to_samples(params.step_ms);
+    size_t offset = 0;
+    int chunk_id = 0;
+
+    LOG("CLI starting simulation: step=%dms (%d samples)", params.step_ms, n_samples_step);
+
+    while (offset < pcmf32.size()) {
+        size_t end = std::min(offset + (size_t)n_samples_step, pcmf32.size());
+        size_t chunk_samples = end - offset;
+
+        // Append chunk to session
+        session.pcmf32_new.insert(
+            session.pcmf32_new.end(),
+            pcmf32.begin() + offset,
+            pcmf32.begin() + end
+        );
+        session.stream_ms += (int)(chunk_samples * 1000 / WHISPER_SAMPLE_RATE);
+
+        LOG("CLI chunk=%d samples=%zu total_ms=%d (%.1fs/%.1fs)",
+            chunk_id++, chunk_samples, session.stream_ms,
+            (float)session.stream_ms / 1000.0f, duration_s);
+
+        // Process using existing function
+        process_session_audio(session, ctx, params);
+
+        offset = end;
+    }
+
+    // Flush any remaining text as final segment
+    if (!session.current_text.empty()) {
+        TranscriptSegment seg;
+        seg.index = session.segments.size();
+        seg.text = session.current_text;
+        seg.t0 = session.current_t0;
+        seg.t1 = session.stream_ms / 10;
+        session.segments.push_back(seg);
+
+        LOG("CLI final segment: index=%d t0=%lld t1=%lld text=\"%s\"",
+            seg.index, (long long)seg.t0, (long long)seg.t1, seg.text.c_str());
+    }
+
+    LOG("CLI completed: %zu segments", session.segments.size());
+
+    // Output results
+    fprintf(stderr, "\n--- Output ---\n\n");
+    output_results(session, params);
+
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -543,6 +683,19 @@ int main(int argc, char** argv) {
         LOG("VAD using energy-based detection (thold=%.4f)", params.vad_thold);
     }
 
+    // CLI mode: process file and exit
+    if (!params.input_file.empty()) {
+        LOG("CLI mode enabled");
+        int result = run_cli_mode(ctx, params);
+        if (g_vad_ctx) {
+            whisper_vad_free(g_vad_ctx);
+            g_vad_ctx = nullptr;
+        }
+        whisper_free(ctx);
+        return result;
+    }
+
+    // Server mode: start HTTP server
     // Create HTTP server
     auto svr = std::make_unique<httplib::Server>();
 
