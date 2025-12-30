@@ -7,6 +7,26 @@ The VAD is slow for both, but the infer is 10 times slower on windows.
 ## Try official releases
 
 Using the official release from https://github.com/ggml-org/whisper.cpp/releases
+I have downloaded all of them to the Downloads folder on windows
+
+- default, nothing
+- openblas
+- cuda
+
+The models are downloaded in the whisper.cpp repo under `models` folder.
+
+## Benchmark Commands
+
+A markdown file with ready-to-run commands has been created. 
+See [benchmark-commands.md](benchmark-commands.md) for the exact commands to run each version manually.
+
+The benchmark results are, for a 48s audio in Chinese, doing transcribe
+
+- [default-output](./default-output.txt) 90s
+- [blas-output](./blas-output.txt) 60s
+- [cuda-output](./cuda-output.txt) 20s
+
+Previous commands
 
 ```powershell
 .\build\bin\Release\whisper-cli.exe `
