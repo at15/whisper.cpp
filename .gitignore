@@ -64,3 +64,6 @@ cmake-build-debug/
 local.properties
 .log
 .exe
+
+# Somehow on windows, the default model download location is not models
+ggml-*.bin

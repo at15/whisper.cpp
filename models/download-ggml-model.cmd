@@ -53,6 +53,7 @@ if %argc% EQU 2 (
 ) else (
   set models_path=%default_download_path%
 )
+echo Models path: %models_path%
 
 set model=%1
 

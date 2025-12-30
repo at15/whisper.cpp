@@ -60,6 +60,8 @@ Available models: `tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `me
 
 ```powershell
 .\build\bin\Release\whisper-cli.exe -m models\ggml-base.en.bin -f samples\jfk.wav
+# TODO: somehow, the model download script on windows does not use models as default path ...
+.\build\bin\Release\whisper-cli.exe -m ggml-base.en.bin -f samples\jfk.wav
 ```
 
 ## Building with SDL2 support (for real-time audio)
